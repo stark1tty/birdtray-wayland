@@ -1,3 +1,9 @@
+# Birdtray — Wayland / Flatpak fork
+
+> **This is a personal fork of [gyunaev/birdtray](https://github.com/gyunaev/birdtray) with patches to make hide/show work on KDE Plasma Wayland and with Flatpak Thunderbird.**
+> The upstream project targets X11. These changes are local and have not been submitted upstream.
+> See the [Wayland / Flatpak Thunderbird](#wayland--flatpak-thunderbird) section below for what was changed and why.
+
 # Birdtray is a system tray new mail notification for Thunderbird, which does not require extensions. [![Build](https://github.com/gyunaev/birdtray/actions/workflows/main.yml/badge.svg)](https://github.com/gyunaev/birdtray/actions/workflows/main.yml)
 
 Birdtray is a free system tray notification for new mail for Thunderbird. It supports Linux and Windows (credit for adding and maintaining Windows support goes to @Abestanis). Patches to support other platforms are welcome.
@@ -88,7 +94,21 @@ This can often be fixed by using the `Repair` functionality in Thunderbird in th
 
 Generally Birdtray expects a spec-compliant desktop manager. If you're using a barebone or non-standard/light/simple desktop manager, it is very likely that some features of Birdtray will not work properly. Most likely candidates are hiding and restoring Thunderbird window(s) - including their position and state. But sometimes even a system tray icon isn't shown. Linux Mint with Cinnamon seem to be one particularly troublesome distro which reports many issues.
 
-Working with Wayland: at this moment Birdtray partially works with Wayland - email monitoring functionality works, but show/hide does not. Please track the issue https://github.com/gyunaev/birdtray/issues/426 to see the current status. Please do not report Wayland-related issues unless you built Birdtray from source yourself.
+### Wayland / Flatpak Thunderbird
+
+On a pure Wayland session (e.g. KDE Plasma Wayland), `QNativeInterface::QX11Application` returns `nullptr`, so the traditional X11 window-detection path cannot find Thunderbird's window handle. The same applies when Thunderbird is installed as a **Flatpak**: its process runs inside a `bwrap` sandbox, so `argv[0]` is `bwrap` rather than `thunderbird`, causing the previous `/proc` scan to miss it.
+
+The following fixes were applied to enable full hide/show support on Wayland + Flatpak Thunderbird:
+
+1. **Process-based fallback detection** (`isThunderbirdProcessRunning()`): when the X11 root window is unavailable, `lookup()` now scans all `/proc/<PID>/cmdline` entries and checks *every* argument (not just `argv[0]`) for the configured process name. This correctly detects Flatpak Thunderbird even though `argv[0]` is `bwrap`.
+
+2. **`mProcessOnly` mode**: a new flag marks when Thunderbird was detected via `/proc` but not via X11. `isValid()`, `isHidden()`, `checkWindow()`, and `lookup()` all branch on this flag so the tray icon behaves correctly without a window handle.
+
+3. **KWin D-Bus scripting for hide/show** (`kwinScriptMinimize()`): on Wayland, window management is delegated to KWin via `qdbus6 org.kde.KWin`. A temporary JavaScript file is written to `/tmp`, loaded as a KWin script, and run asynchronously.
+   - **Hide**: sets `skipTaskbar = true`, `skipPager = true`, `minimized = true` — removes the window from the taskbar and panel pager.
+   - **Show**: sets `skipTaskbar = false`, `skipPager = false`, `minimized = false`, and assigns `workspace.activeWindow` to raise and focus the window.
+
+These changes are in effect when building from source on a Wayland session with KDE Plasma. The `qdbus6` binary must be available (provided by `qttools6` / `qt6-tools`). Email monitoring continues to work identically to the X11 path.
 
 ## Submitting bugs and feature requests
 

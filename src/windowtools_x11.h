@@ -49,6 +49,12 @@ class WindowTools_X11 : public WindowTools
         // Makes sure our window ID is still valid, or reinitializes it
         bool    checkWindow();
 
+        // Scan /proc for a running Thunderbird process (fallback for Wayland-native TB)
+        bool    isThunderbirdProcessRunning();
+
+        // Minimize or un-minimize the TB window via KWin D-Bus scripting (Wayland)
+        void    kwinScriptMinimize( bool minimize );
+
         // Our Window ID
         Window      mWinId;
 
@@ -60,6 +66,9 @@ class WindowTools_X11 : public WindowTools
 
         // State check timer
         QTimer      mWindowStateTimer;
+
+        // True when TB is detected via /proc but not via X11 (Wayland-native mode)
+        bool        mProcessOnly;
 };
 
 #endif // WINDOWTOOLS_X11_H

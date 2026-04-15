@@ -1,8 +1,13 @@
 #include <QTimer>
 #include <QGuiApplication>
+#include <QDir>
+#include <QFile>
+#include <QProcess>
+#include <QStringList>
 
 #include "birdtrayapp.h"
 #include "windowtools_x11.h"
+#include "settings.h"
 #include "utils.h"
 #include "log.h"
 
@@ -356,9 +361,10 @@ static bool getCardinalProperty(Display *display, Window w, Atom prop, long *dat
 
 WindowTools_X11::WindowTools_X11()
     : WindowTools()
-{  
+{
     mWinId = None;
     mHiddenStateCounter = 0;
+    mProcessOnly = false;
 
     connect( &mWindowStateTimer, &QTimer::timeout, this, &WindowTools_X11::timerWindowState );
     mWindowStateTimer.setInterval( 250 );
@@ -371,22 +377,55 @@ WindowTools_X11::~WindowTools_X11()
 
 bool WindowTools_X11::lookup()
 {
-    if ( x11_appRootWindow() == None )
-        return false;
+    // Try X11 window detection only when an X11 display is available.
+    // On pure Wayland sessions x11_display() returns null and we skip straight
+    // to the process-based fallback below.
+    if ( x11_appRootWindow() != None )
+    {
+        // If we already have a valid X11 window handle, done
+        if ( mWinId != None && isValidWindowId( x11_display(), mWinId ) )
+        {
+            mProcessOnly = false;
+            return true;
+        }
 
-    if ( isValid() )
-        return true;
+        // Try to find the window via X11
+        mWinId = findWindow(x11_display(), x11_appRootWindow(), ! BirdtrayApp::get()->getSettings()->mIgnoreNETWMhints,
+                BirdtrayApp::get()->getSettings()->mThunderbirdWindowMatch);
 
-    mWinId = findWindow(x11_display(), x11_appRootWindow(), ! BirdtrayApp::get()->getSettings()->mIgnoreNETWMhints,
-            BirdtrayApp::get()->getSettings()->mThunderbirdWindowMatch);
+        Log::debug("Window ID found: %lX", mWinId );
 
-    Log::debug("Window ID found: %lX", mWinId );
+        if ( mWinId != None )
+        {
+            mProcessOnly = false;
+            return true;
+        }
+    }
 
-    return mWinId != None;
+    // X11 search found nothing (or X11 unavailable on Wayland) — check if TB
+    // is running as a Wayland-native / Flatpak process.
+    mProcessOnly = isThunderbirdProcessRunning();
+    if ( mProcessOnly )
+        Log::debug("Thunderbird not found via X11 but process is running (Wayland-native mode)" );
+
+    return mProcessOnly;
 }
 
 bool WindowTools_X11::show()
 {
+    // In Wayland-native (process-only) mode we can't manipulate the window via X11.
+    // Re-invoke the configured TB command line — Flatpak / D-Bus activation will raise
+    // the already-running instance instead of launching a second one.
+    if ( mProcessOnly )
+    {
+        // Un-minimize, restore to taskbar, and focus via KWin scripting
+        kwinScriptMinimize( false );
+
+        mHiddenStateCounter = 0;
+        emit onWindowShown();
+        return true;
+    }
+
     if ( !checkWindow() )
         return false;
 
@@ -421,6 +460,22 @@ bool WindowTools_X11::show()
 
 bool WindowTools_X11::hide()
 {
+    if ( mProcessOnly )
+    {
+        if ( mHiddenStateCounter != 0 )
+        {
+            Log::debug("Process-only mode: window already hidden (counter %d), ignored", mHiddenStateCounter );
+            return false;
+        }
+
+        // Minimize the Wayland-native TB window via KWin D-Bus scripting
+        kwinScriptMinimize( true );
+
+        mHiddenStateCounter = 2;
+        emit onWindowHidden();
+        return true;
+    }
+
     if ( !checkWindow() )
         return false;
 
@@ -445,6 +500,9 @@ bool WindowTools_X11::hide()
 
 bool WindowTools_X11::isHidden()
 {
+    if ( mProcessOnly )
+        return mHiddenStateCounter == 2;
+
     return mHiddenStateCounter == 2 && mWinId != activeWindow( x11_display() );
 }
 
@@ -463,7 +521,9 @@ bool WindowTools_X11::closeWindow()
 
 bool WindowTools_X11::isValid()
 {
-    return mWinId != None && isValidWindowId( x11_display(), mWinId );
+    if ( mWinId != None && isValidWindowId( x11_display(), mWinId ) )
+        return true;
+    return mProcessOnly;
 }
 
 void WindowTools_X11::doHide()
@@ -541,8 +601,126 @@ bool WindowTools_X11::checkWindow()
     if ( !x11_display() )
         return false;
 
+    if ( mProcessOnly )
+        return true;
+
     if ( mWinId == None || !isValidWindowId( x11_display(), mWinId ) )
         return lookup();
 
     return true;
+}
+
+void WindowTools_X11::kwinScriptMinimize( bool minimize )
+{
+    // Write a one-shot KWin script to minimize/restore the TB window by caption.
+    // This is the only reliable way to control a Wayland-native window from outside
+    // the compositor on KDE Plasma.
+    const QString windowMatch = BirdtrayApp::get()->getSettings()->mThunderbirdWindowMatch.trimmed();
+    const QString searchStr   = windowMatch.isEmpty() ? QString("Thunderbird") : windowMatch;
+    const QString minimizeVal = minimize ? "true" : "false";
+
+    // When hiding: minimize and remove from taskbar/pager.
+    // When showing: restore from taskbar, un-minimize, and activate (focus).
+    const QString script = minimize
+        ? QString(
+            "var w = workspace.windowList();\n"
+            "for (var i = 0; i < w.length; i++) {\n"
+            "    if (w[i].caption.indexOf(\"%1\") >= 0) {\n"
+            "        w[i].skipTaskbar = true;\n"
+            "        w[i].skipPager   = true;\n"
+            "        w[i].minimized   = true;\n"
+            "        break;\n"
+            "    }\n"
+            "}\n"
+          ).arg(QString(searchStr).replace("\"", "\\\""))
+        : QString(
+            "var w = workspace.windowList();\n"
+            "for (var i = 0; i < w.length; i++) {\n"
+            "    if (w[i].caption.indexOf(\"%1\") >= 0) {\n"
+            "        w[i].skipTaskbar = false;\n"
+            "        w[i].skipPager   = false;\n"
+            "        w[i].minimized   = false;\n"
+            "        workspace.activeWindow = w[i];\n"
+            "        break;\n"
+            "    }\n"
+            "}\n"
+          ).arg(QString(searchStr).replace("\"", "\\\""));
+
+    const QString scriptPath = QDir::tempPath() + "/birdtray_kwin_minimize.js";
+    QFile f( scriptPath );
+    if ( !f.open( QIODevice::WriteOnly | QIODevice::Truncate ) )
+    {
+        Log::debug("kwinScriptMinimize: failed to write temp script" );
+        return;
+    }
+    f.write( script.toUtf8() );
+    f.close();
+
+    QProcess loadProc;
+    loadProc.start("qdbus6", {
+        "org.kde.KWin", "/Scripting",
+        "org.kde.kwin.Scripting.loadScript", scriptPath
+    });
+
+    if ( !loadProc.waitForFinished( 2000 ) )
+    {
+        Log::debug("kwinScriptMinimize: qdbus6 loadScript timed out" );
+        QFile::remove( scriptPath );
+        return;
+    }
+
+    bool ok;
+    int scriptId = loadProc.readAllStandardOutput().trimmed().toInt( &ok );
+    if ( !ok || scriptId <= 0 )
+    {
+        Log::debug("kwinScriptMinimize: loadScript returned invalid id (qdbus6 not available?)" );
+        QFile::remove( scriptPath );
+        return;
+    }
+
+    // Run async — don't block the GUI thread waiting for KWin to execute the script
+    QProcess::startDetached("qdbus6", {
+        "org.kde.KWin",
+        QString("/Scripting/Script%1").arg(scriptId),
+        "org.kde.kwin.Script.run"
+    });
+
+    // Temp file will be cleaned up after a short delay to ensure KWin has read it
+    QTimer::singleShot( 500, [scriptPath]() { QFile::remove( scriptPath ); } );
+    Log::debug("kwinScriptMinimize: minimize=%s via KWin script id %d", minimize ? "true" : "false", scriptId );
+}
+
+bool WindowTools_X11::isThunderbirdProcessRunning()
+{
+    const QString processName = BirdtrayApp::get()->getSettings()->mThunderbirdProcessName;
+    QDir procDir( "/proc" );
+    const QStringList entries = procDir.entryList( QDir::Dirs | QDir::NoDotAndDotDot );
+
+    for ( const QString& entry : entries )
+    {
+        bool ok;
+        entry.toInt( &ok );
+        if ( !ok )
+            continue;
+
+        QFile cmdlineFile( QString("/proc/%1/cmdline").arg(entry) );
+        if ( !cmdlineFile.open( QIODevice::ReadOnly ) )
+            continue;
+
+        const QByteArray raw = cmdlineFile.readAll();
+        // cmdline args are NUL-separated. We scan all args, not just argv[0],
+        // because Flatpak Thunderbird runs inside bwrap — the actual
+        // "thunderbird" string may appear as a later argument or in the path
+        // of the in-container executable.
+        const QList<QByteArray> args = raw.split('\0');
+        for ( const QByteArray& arg : args )
+        {
+            if ( arg.isEmpty() )
+                continue;
+            if ( QString::fromLocal8Bit(arg).contains( processName, Qt::CaseInsensitive ) )
+                return true;
+        }
+    }
+
+    return false;
 }
