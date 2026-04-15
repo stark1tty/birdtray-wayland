@@ -16,6 +16,7 @@ installer/arch.nsh
 installer/installerTranslations.nsi
 installer/makeInstallerTranslations.exe
 
+.claude/*
 .idea/*
 !.idea/codeStyles
 !.idea/runConfigurations
